@@ -27,7 +27,14 @@ Column map:
   U  Money Sheet 1                    — formula vs New Money Sheet tab
   V  Money Sheet 2                    — formula vs 2023 Money tab
 
-NOTE: Position ruleset (column F) will be refined per user spec.
+Position hierarchy (column F):
+  Offense — QB · RB · FB · WR · TE
+  OL group  OL > IOL > OG > {RG, LG} · OL > OT > {RT, LT} · C
+  DL group  DL > {DT, DE}
+  LB group  LB > {MLB, OLB}
+  DB group  DB > {CB, S}
+  Special   P · K · LS
+  Rule: when in doubt, use the broader position.
 
 Usage:
   # Fill one row (reads name from A60, writes D60:V60):
@@ -119,6 +126,182 @@ def _v_formula(row: int) -> str:
         f"=IF(ISERROR(MATCH(A{row},'2023 Money'!$A$2:$A$1153,0)),"
         f"\"Missing\",\"Present\")"
     )
+
+
+# ---------------------------------------------------------------------------
+# Position resolver
+# ---------------------------------------------------------------------------
+#
+# Hierarchy (broader beats narrower; when in doubt go broader):
+#
+#   OL  ← IOL ← OG ← { RG, LG }
+#   OL  ← OT  ← { RT, LT }
+#   C
+#   DL  ← { DT, DE }
+#   LB  ← { MLB, OLB }
+#   DB  ← { CB, S }
+#
+# Raw inputs from Lions page / PFR / ESPN are normalised to these codes.
+# ---------------------------------------------------------------------------
+
+# Exact matches (case-insensitive) → our code
+_POS_EXACT: dict[str, str] = {
+    # Skill
+    "qb": "QB", "quarterback": "QB",
+    "rb": "RB", "hb": "RB", "halfback": "RB", "runningback": "RB", "running back": "RB",
+    "fb": "FB", "fullback": "FB",
+    "wr": "WR", "wide receiver": "WR", "wideout": "WR",
+    "te": "TE", "tight end": "TE",
+    # OL — specific
+    "rg": "RG", "right guard": "RG",
+    "lg": "LG", "left guard": "LG",
+    "rt": "RT", "right tackle": "RT",
+    "lt": "LT", "left tackle": "LT",
+    "c":  "C",  "center": "C",
+    # OL — broad
+    "og": "OG", "g": "OG", "guard": "OG",
+    "ot": "OT", "t": "OT", "tackle": "OT",
+    "iol": "IOL",
+    "ol": "OL", "o-line": "OL", "offensive line": "OL", "offensive lineman": "OL",
+    # DL
+    "de": "DE", "defensive end": "DE",
+    "dt": "DT", "defensive tackle": "DT",
+    "nt": "DT", "nose tackle": "DT", "ng": "DT", "nose guard": "DT",
+    "dl": "DL", "defensive line": "DL", "defensive lineman": "DL",
+    # LB
+    "mlb": "MLB", "ilb": "MLB", "inside linebacker": "MLB", "middle linebacker": "MLB",
+    "olb": "OLB", "outside linebacker": "OLB",
+    "lolb": "OLB", "rolb": "OLB",
+    "lb": "LB", "linebacker": "LB",
+    # DB
+    "cb": "CB", "cornerback": "CB", "corner": "CB",
+    "s":  "S",  "safety": "S",
+    "ss": "S",  "strong safety": "S",
+    "fs": "S",  "free safety": "S",
+    "db": "DB", "defensive back": "DB",
+    # Special teams
+    "p": "P", "punter": "P",
+    "k": "K", "pk": "K", "kicker": "K", "placekicker": "K",
+    "ls": "LS", "long snapper": "LS",
+}
+
+# When a raw string contains MULTIPLE position codes, resolve via these
+# combination → broader mapping rules.
+_OL_CODES  = {"RG", "LG", "OG", "RT", "LT", "OT", "C", "IOL", "OL"}
+_DL_CODES  = {"DE", "DT"}
+_LB_CODES  = {"MLB", "OLB", "LB"}
+_DB_CODES  = {"CB", "S", "DB"}
+
+
+def resolve_position(raw_lions: str, raw_pfr: str = "") -> str:
+    """
+    Return the standardised position code for column F.
+
+    Steps:
+      1. Try exact lookup on Lions raw position.
+      2. Try exact lookup on PFR raw position.
+      3. If either source contains a slash/hyphen combination, resolve via
+         the broader-position rules.
+      4. Default to the broader position when ambiguous.
+    """
+    lions_code = _pos_lookup(raw_lions)
+    pfr_code   = _pos_lookup(raw_pfr)
+
+    # If both agree (or one is empty), return the non-empty one
+    if lions_code == pfr_code:
+        return lions_code
+    if not lions_code:
+        return pfr_code
+    if not pfr_code:
+        return lions_code
+
+    # They differ — apply the "when in doubt go broader" rule
+    return _broader(lions_code, pfr_code)
+
+
+def _pos_lookup(raw: str) -> str:
+    """Normalise a single raw position string → our code."""
+    if not raw:
+        return ""
+
+    key = raw.strip().lower()
+
+    # Direct hit
+    if key in _POS_EXACT:
+        return _POS_EXACT[key]
+
+    # Try stripping punctuation / spaces
+    key_clean = re.sub(r"[\s\-/]", "", key)
+    if key_clean in _POS_EXACT:
+        return _POS_EXACT[key_clean]
+
+    # Slash or hyphen combo, e.g. "G/C", "DE/DT", "ILB/OLB", "G/T"
+    parts_raw = re.split(r"[/\-]", raw.strip())
+    if len(parts_raw) > 1:
+        codes = [_pos_lookup(p.strip()) for p in parts_raw if p.strip()]
+        codes = [c for c in codes if c]
+        if codes:
+            result = codes[0]
+            for c in codes[1:]:
+                result = _broader(result, c)
+            return result
+
+    # Partial match — walk the exact table looking for a substring
+    for token, code in _POS_EXACT.items():
+        if token in key:
+            return code
+
+    return ""  # unknown — leave blank, human can fill
+
+
+def _broader(a: str, b: str) -> str:
+    """Return the broader of two position codes per the hierarchy rules."""
+    pair = frozenset({a, b})
+
+    # ---- OL group ----
+    if pair <= _OL_CODES:
+        # If any tackle involved → OL beats IOL/OG
+        if "OT" in pair or "RT" in pair or "LT" in pair:
+            if "OG" in pair or "RG" in pair or "LG" in pair or "IOL" in pair or "C" in pair:
+                return "OL"
+            # Both are tackle-side
+            if pair == {"RT", "LT"}:
+                return "OT"
+            return "OT" if "OT" in pair else "OL"
+        # Interior only (G + C → IOL)
+        if ("OG" in pair or "RG" in pair or "LG" in pair) and "C" in pair:
+            return "IOL"
+        if ("OG" in pair or "IOL" in pair) and b in {"RG", "LG"}:
+            return "OG" if "OG" in pair else "IOL"
+        if pair == {"RG", "LG"}:
+            return "OG"
+        # Default OL group: return the one already in the pair that's broadest
+        for broad in ("OL", "IOL", "OT", "OG", "C", "RT", "LT", "RG", "LG"):
+            if broad in pair:
+                return broad
+
+    # ---- DL group ----
+    if pair <= (_DL_CODES | {"DL"}):
+        return "DL"
+
+    # ---- LB group ----
+    if pair <= _LB_CODES:
+        if "LB" in pair:
+            return "LB"
+        if pair == {"MLB", "OLB"}:
+            return "LB"
+        return a  # shouldn't reach here
+
+    # ---- DB group ----
+    if pair <= _DB_CODES:
+        if "DB" in pair:
+            return "DB"
+        if pair == {"CB", "S"}:
+            return "DB"
+        return a
+
+    # Cross-group: genuinely ambiguous — return first input (Lions is primary)
+    return a
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +473,7 @@ def _parse_weight(s: str) -> str:
 _pfr_cache: dict[str, dict] = {}
 
 _PFR_EMPTY = {
-    "pfr_url": "", "headshot_pfr": "",
+    "pfr_url": "", "headshot_pfr": "", "pfr_position": "",
     "dob": "", "nfl_year": "",
     "draft_team": "", "draft_round": "", "draft_pick": "", "draft_year": "",
     "lions_year": "", "teams": "", "acquired": "",
@@ -376,6 +559,9 @@ def _pfr_parse_page(html: str, url: str) -> dict:
 
     for p in meta.find_all("p"):
         text = p.get_text(" ", strip=True)
+
+        if text.startswith("Position:"):
+            result["pfr_position"] = text.replace("Position:", "").strip().split()[0]
 
         if "Born:" in text:
             # Try structured element first
@@ -510,7 +696,10 @@ def build_row(player: dict, pfr: dict, row_num: int, college: str) -> list:
         player.get("number", ""),          # C
         pfr.get("pfr_url", ""),            # D
         headshot,                          # E
-        player.get("position", ""),        # F
+        resolve_position(                  # F
+            player.get("position", ""),
+            pfr.get("pfr_position", ""),
+        ),
         player.get("ht_ft", ""),           # G
         player.get("ht_in", ""),           # H
         player.get("weight", ""),          # I
