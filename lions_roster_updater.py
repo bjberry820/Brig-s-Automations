@@ -327,27 +327,41 @@ def fetch_roster() -> list[dict]:
 
 
 def _scrape_lions_page() -> list[dict]:
-    """Scrape player rows from detroitlions.com."""
+    """
+    Scrape player rows from detroitlions.com using Playwright.
+    The page is JS-rendered — requests + BeautifulSoup only returns ~18 players
+    from the static HTML. Playwright waits for the full table to load.
+    """
     try:
-        resp = requests.get(LIONS_ROSTER_URL, headers=BROWSER_HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "lxml")
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("  Playwright not installed — run: pip install playwright && playwright install chromium")
+        return []
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ))
+            page.goto(LIONS_ROSTER_URL, wait_until="domcontentloaded", timeout=30000)
+            # Wait for at least one player row to appear
+            page.wait_for_selector("table tbody tr", timeout=15000)
+            html = page.content()
+            browser.close()
+
+        soup = BeautifulSoup(html, "lxml")
         players = []
-
-        # Try standard NFL table layout first
-        rows = soup.select("table tbody tr")
-        if not rows:
-            # Try card/grid layout used by some NFL sites
-            rows = soup.select("[class*='roster'] [class*='player-row'], .d3-o-table__body tr")
-
-        for row in rows:
+        for row in soup.select("table tbody tr"):
             p = _parse_lions_row(row)
             if p:
                 players.append(p)
-
         return players
+
     except Exception as e:
-        print(f"  Lions page error: {e}")
+        print(f"  Lions page (Playwright) error: {e}")
         return []
 
 
